@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Driver Route</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    
+    <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyAG_7S4p5AOJSIFQAQOQWSpxisOKo365nw&libraries=geometry"></script>
+    
+    <style>
+        :root {
+            --bg-color: var(--tg-theme-bg-color, #ffffff);
+            --text-color: var(--tg-theme-text-color, #222222);
+            --hint-color: var(--tg-theme-hint-color, #999999);
+            --button-color: var(--tg-theme-button-color, #007aff);
+            --secondary-bg: var(--tg-theme-secondary-bg-color, #f0f0f0);
+            --accent-blue: #007aff;
+        }
+
+        body, html { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: var(--bg-color); overflow: hidden; }
+        #map { width: 100%; height: 100vh; z-index: 1; }
+
+        .gmnoprint a, .gmnoprint span, .gm-style-cc { display:none; }
+
+        #bottom-panel {
+            position: absolute; bottom: 0; left: 0; right: 0;
+            background-color: var(--bg-color); padding: 24px 20px;
+            border-radius: 24px 24px 0 0; box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.15);
+            z-index: 1000; display: flex; flex-direction: column; gap: 16px;
+        }
+
+        #bottom-panel::before {
+            content: ''; position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
+            width: 36px; height: 4px; background-color: var(--hint-color); border-radius: 2px; opacity: 0.5;
+        }
+
+        .header-box { display: flex; justify-content: space-between; align-items: center; }
+        #statusText { font-size: 18px; font-weight: 700; color: var(--text-color); margin: 0; }
+        .progress-badge { background-color: var(--secondary-bg); color: var(--text-color); padding: 4px 10px; border-radius: 12px; font-size: 14px; font-weight: 600; }
+        #controls { display: none; gap: 12px; width: 100%; }
+
+        button {
+            flex: 1; padding: 14px; border: none; border-radius: 12px;
+            font-size: 16px; font-weight: 600; cursor: pointer;
+            transition: opacity 0.2s, transform 0.1s; display: flex; align-items: center; justify-content: center; gap: 8px;
+        }
+        button:active { transform: scale(0.96); }
+        .btn-undo { background-color: var(--secondary-bg); color: var(--text-color); }
+        .btn-reset { background-color: rgba(255, 59, 48, 0.1); color: #ff3b30; }
+
+        /* ИЗЯЩНЫЕ ЦЕННИКИ БЕЗ ЖИРНЫХ РАМОК */
+        .price-label {
+            background-color: rgba(40, 167, 69, 0.95);
+            color: #ffffff !important;
+            font-weight: 600;
+            padding: 2px 5px;
+            border-radius: 4px;
+            font-size: 11px;
+            border: 1px solid rgba(255,255,255,0.8);
+            box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+            margin-top: -18px;
+            white-space: nowrap;
+        }
+        .price-label-selected {
+            background-color: #007aff;
+            color: #ffffff !important;
+            font-weight: 700;
+            padding: 3px 6px;
+            border-radius: 5px;
+            font-size: 13px;
+            border: 1px solid #ffffff;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+            margin-top: -24px;
+            white-space: nowrap;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    
+    <div id="bottom-panel">
+        <div class="header-box">
+            <div id="statusText">Loading map...</div>
+            <div class="progress-badge" id="progressCounter">0 / 0</div>
+        </div>
+        <div id="controls">
+            <button class="btn-undo" onclick="undoLast()">🔙 Undo</button>
+            <button class="btn-reset" onclick="resetRoute()">🔄 Reset</button>
+        </div>
+    </div>
+
+    <script>
+        let tg = window.Telegram.WebApp;
+        tg.expand();
+        tg.setHeaderColor('secondary_bg_color'); 
+        tg.MainButton.text = "CONFIRM ROUTE";
+        tg.MainButton.color = "#007aff";
+
+        let map, polyline;
+        let clients = [];
+        let selectedRoute = []; 
+        let markers = [];
+        let OFFICE_COORD = { lat: 34.0522, lng: -118.2437 }; 
+
+        const svgUnselected = { path: google.maps.SymbolPath.CIRCLE, fillColor: '#ffffff', fillOpacity: 1, strokeColor: '#777777', strokeWeight: 3, scale: 8 };
+        const svgSelected = { path: google.maps.SymbolPath.CIRCLE, fillColor: '#007aff', fillOpacity: 1, strokeColor: '#ffffff', strokeWeight: 2, scale: 11 };
+        const svgOffice = { path: google.maps.SymbolPath.CIRCLE, fillColor: '#222222', fillOpacity: 1, strokeColor: '#ffffff', strokeWeight: 2, scale: 10 };
+
+        const urlParams = new URLSearchParams(window.location.search);
+        const dataStr = urlParams.get('data');
+        const oLat = parseFloat(urlParams.get('olat'));
+        const oLng = parseFloat(urlParams.get('olng'));
+        
+        if (!isNaN(oLat) && !isNaN(oLng)) {
+            OFFICE_COORD = { lat: oLat, lng: oLng };
+        }
+
+        if (dataStr) {
+            try { clients = JSON.parse(decodeURIComponent(dataStr)); } 
+            catch (e) { document.getElementById('statusText').innerText = "Data Error!"; }
+        }
+
+        function initMap() {
+            map = new google.maps.Map(document.getElementById('map'), {
+                zoom: 10, center: OFFICE_COORD, 
+                disableDefaultUI: true, 
+                gestureHandling: "greedy",
+                clickableIcons: false, // ОТКЛЮЧАЕТ КЛИКИ ПО ГОРОДАМ И МАГАЗИНАМ (POI)
+                styles: [ { stylers: [ { saturation: 20 }, { lightness: 10 } ] } ] 
+            });
+
+            new google.maps.TrafficLayer().setMap(map);
+
+            new google.maps.Marker({
+                map: map,
+                position: OFFICE_COORD,
+                icon: svgOffice,
+                label: { text: "🏠", fontSize: "14px" },
+                zIndex: 999 
+            });
+
+            polyline = new google.maps.Polyline({
+                strokeColor: '#007aff', strokeOpacity: 0.8, strokeWeight: 5, map: map,
+                path: [OFFICE_COORD] 
+            });
+
+            if (clients.length > 0) placeMarkers();
+            else document.getElementById('statusText').innerText = "No addresses";
+        }
+
+        function placeMarkers() {
+            let bounds = new google.maps.LatLngBounds();
+            bounds.extend(OFFICE_COORD); 
+
+            let coordTracker = {};
+
+            clients.forEach((client, index) => {
+                let key = client.lat.toFixed(4) + '_' + client.lng.toFixed(4);
+                coordTracker[key] = (coordTracker[key] || 0) + 1;
+                let count = coordTracker[key];
+
+                let finalLat = client.lat;
+                let finalLng = client.lng;
+
+                if (count > 1) {
+                    let offsetRadius = 0.00015 * (count - 1); 
+                    let angle = (count - 1) * (Math.PI / 3); 
+                    finalLat += offsetRadius * Math.cos(angle);
+                    finalLng += offsetRadius * Math.sin(angle);
+                }
+
+                let location = { lat: finalLat, lng: finalLng };
+                bounds.extend(location);
+                
+                let marker = new google.maps.Marker({
+                    map: map, 
+                    position: location, 
+                    icon: svgUnselected,
+                    label: { text: "$" + client.total, className: "price-label" },
+                    zIndex: 100 
+                });
+
+                marker.clientIndex = index;
+                marker.addListener('click', () => handleMarkerClick(client, marker, location));
+                markers.push(marker);
+            });
+
+            map.fitBounds(bounds, { bottom: 180, left: 30, right: 30, top: 30 }); 
+            updateUI();
+        }
+
+        function handleMarkerClick(client, marker, location) {
+            if (selectedRoute.includes(client)) return; 
+
+            selectedRoute.push(client);
+            let currentNumber = selectedRoute.length;
+            
+            marker.setIcon(svgSelected);
+            marker.setLabel({ text: currentNumber.toString() + " • $" + client.total, className: "price-label-selected" });
+            marker.setZIndex(10); 
+
+            polyline.getPath().push(new google.maps.LatLng(location.lat, location.lng));
+
+            updateUI();
+            if (tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
+
+            if (selectedRoute.length === clients.length) {
+                tg.MainButton.show();
+                if (tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
+            }
+        }
+
+        function undoLast() {
+            if (selectedRoute.length === 0) return;
+            let lastClient = selectedRoute.pop();
+            
+            let marker = markers.find(m => clients[m.clientIndex] === lastClient);
+            if (marker) {
+                marker.setIcon(svgUnselected);
+                marker.setLabel({ text: "$" + clients[marker.clientIndex].total, className: "price-label" });
+                marker.setZIndex(100);
+            }
+
+            polyline.getPath().pop();
+
+            tg.MainButton.hide();
+            updateUI();
+            if (tg.HapticFeedback) tg.HapticFeedback.impactOccurred('light');
+        }
+
+        function resetRoute() {
+            if (selectedRoute.length === 0) return;
+            selectedRoute = [];
+            markers.forEach(marker => { 
+                marker.setIcon(svgUnselected); 
+                marker.setLabel({ text: "$" + clients[marker.clientIndex].total, className: "price-label" }); 
+                marker.setZIndex(100);
+            });
+
+            polyline.setPath([OFFICE_COORD]);
+            
+            tg.MainButton.hide();
+            updateUI();
+            if (tg.HapticFeedback) tg.HapticFeedback.impactOccurred('rigid');
+        }
+
+        function updateUI() {
+            let total = clients.length;
+            let current = selectedRoute.length;
+            document.getElementById('progressCounter').innerText = `${current} / ${total}`;
+            document.getElementById('controls').style.display = current > 0 ? "flex" : "none";
+
+            if (current === 0) {
+                document.getElementById('statusText').innerText = "Select first point";
+                document.getElementById('statusText').style.color = "var(--text-color)";
+            }
+            else if (current < total) {
+                document.getElementById('statusText').innerText = "Where next?";
+                document.getElementById('statusText').style.color = "var(--text-color)";
+            }
+            else {
+                document.getElementById('statusText').innerText = "Route completed!";
+                document.getElementById('statusText').style.color = "#007aff";
+            }
+        }
+
+        Telegram.WebApp.onEvent('mainButtonClicked', function() {
+            tg.sendData(JSON.stringify(selectedRoute)); 
+        });
+
+        window.onload = initMap;
+    </script>
+</body>
+</html>
